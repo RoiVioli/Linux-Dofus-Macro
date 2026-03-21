@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QSizePolicy, QMessageBox)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor
-from pynput import keyboard
+from pynput import keyboard, mouse as pmouse
 
 
 CONFIG_DIR  = Path.home() / ".config" / "dofusswitch"
@@ -64,8 +64,27 @@ def apply_shadow(widget, blur=20, offset_y=4, alpha=40):
     widget.setGraphicsEffect(shadow)
 
 
+# Maps a stored hotkey string to a human-readable display label
+def hotkey_display_label(key_str):
+    labels = {
+        "mouse:middle":  "Clic molette",
+        "mouse:button8": "Souris bouton 4",
+        "mouse:button9": "Souris bouton 5",
+    }
+    return labels.get(key_str, key_str)
+
+
 class HotkeyLineEdit(QLineEdit):
     PLACEHOLDER = "Configurer une macro"
+
+    # Maps Qt mouse buttons → internal storage string
+    MOUSE_BUTTON_MAP = {
+        Qt.MouseButton.MiddleButton:  "mouse:middle",
+        Qt.MouseButton.BackButton:    "mouse:button8",
+        Qt.MouseButton.ForwardButton: "mouse:button9",
+        Qt.MouseButton.ExtraButton1:  "mouse:button8",
+        Qt.MouseButton.ExtraButton2:  "mouse:button9",
+    }
 
     def __init__(self, current_val="", parent=None):
         super().__init__(parent)
@@ -73,10 +92,15 @@ class HotkeyLineEdit(QLineEdit):
         self.key_str = current_val
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFixedHeight(34)
+        # Accept focus via mouse click and tab
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._refresh_text()
 
     def _refresh_text(self):
-        self.setText(self.key_str if self.key_str else self.PLACEHOLDER)
+        if self.key_str:
+            self.setText(hotkey_display_label(self.key_str))
+        else:
+            self.setText(self.PLACEHOLDER)
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
@@ -86,6 +110,43 @@ class HotkeyLineEdit(QLineEdit):
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
         self._refresh_text()
+
+    def mousePressEvent(self, event):
+        btn = event.button()
+
+        # Left click: toggle focus — first click focuses, second click is ignored
+        if btn == Qt.MouseButton.LeftButton:
+            if not self.hasFocus():
+                self.setFocus(Qt.FocusReason.MouseFocusReason)
+            # Do NOT call super() — prevents QLineEdit from eating the event
+            event.accept()
+            return
+
+        # Only handle other buttons when focused
+        if not self.hasFocus():
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            event.accept()
+            return
+
+        # Right click: clear the hotkey
+        if btn == Qt.MouseButton.RightButton:
+            self.key_str = ""
+            self._refresh_text()
+            self.editingFinished.emit()
+            self.clearFocus()
+            event.accept()
+            return
+
+        # Any other mouse button: record as hotkey
+        btn_name = self.MOUSE_BUTTON_MAP.get(btn)
+        if btn_name is None:
+            # Generic fallback for unlisted buttons
+            btn_name = f"mouse:button{int(btn)}"
+        self.key_str = btn_name
+        self._refresh_text()
+        self.editingFinished.emit()
+        self.clearFocus()
+        event.accept()
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -388,11 +449,13 @@ class DofusSwitchApp(QMainWindow):
         self.setWindowTitle("DofusSwitch — Team Manager")
         self.setMinimumSize(820, 560)
 
-        self.config           = load_config()
-        self.hotkeys_listener = None
-        self.last_switch_time = 0
-        self.windows          = []
-        self._indices         = {"TOTAL": 0, "A": 0, "B": 0}
+        self.config              = load_config()
+        self.hotkeys_listener    = None
+        self.mouse_listener      = None
+        self._mouse_callbacks    = {}   # button_name → callback
+        self.last_switch_time    = 0
+        self.windows             = []
+        self._indices            = {"TOTAL": 0, "A": 0, "B": 0}
 
         self._apply_stylesheet()
         self._build_ui()
@@ -818,32 +881,73 @@ class DofusSwitchApp(QMainWindow):
         self._indices[key] = (idx + 1) % len(valid)
 
     def restart_hotkeys(self):
-        """Rebuild the global hotkey listener from current config."""
+        """Rebuild keyboard and mouse global hotkey listeners from current config."""
+        # Stop existing listeners
         if self.hotkeys_listener:
             try: self.hotkeys_listener.stop()
             except: pass
+        if self.mouse_listener:
+            try: self.mouse_listener.stop()
+            except: pass
 
-        mapping = {}
+        kb_mapping      = {}  # key_str → callback  (keyboard hotkeys)
+        self._mouse_callbacks = {}  # btn_name → callback  (mouse hotkeys)
 
+        def _register(hk, cb):
+            if not hk:
+                return
+            if hk.startswith("mouse:"):
+                self._mouse_callbacks[hk] = cb
+            else:
+                kb_mapping[hk] = cb
+
+        # Per-account direct focus shortcuts
         for win in self.windows:
             hk = self.config.get(win["pid"], {}).get("hk")
-            if hk:
-                mapping[hk] = (lambda w=win["wid"]: focus_window(w))
+            _register(hk, lambda w=win["wid"]: focus_window(w))
 
+        # Global cycle macros
         g = self.config.get("global", {})
-        if g.get("cycle_hk"):        mapping[g["cycle_hk"]]        = lambda: self.cycle_logic(None,  1)
-        if g.get("cycle_prev_hk"):   mapping[g["cycle_prev_hk"]]   = lambda: self.cycle_logic(None, -1)
-        if g.get("group_a_hk"):      mapping[g["group_a_hk"]]      = lambda: self.cycle_logic("A",  1)
-        if g.get("group_a_prev_hk"): mapping[g["group_a_prev_hk"]] = lambda: self.cycle_logic("A", -1)
-        if g.get("group_b_hk"):      mapping[g["group_b_hk"]]      = lambda: self.cycle_logic("B",  1)
-        if g.get("group_b_prev_hk"): mapping[g["group_b_prev_hk"]] = lambda: self.cycle_logic("B", -1)
+        _register(g.get("cycle_hk"),        lambda: self.cycle_logic(None,  1))
+        _register(g.get("cycle_prev_hk"),   lambda: self.cycle_logic(None, -1))
+        _register(g.get("group_a_hk"),      lambda: self.cycle_logic("A",   1))
+        _register(g.get("group_a_prev_hk"), lambda: self.cycle_logic("A",  -1))
+        _register(g.get("group_b_hk"),      lambda: self.cycle_logic("B",   1))
+        _register(g.get("group_b_prev_hk"), lambda: self.cycle_logic("B",  -1))
 
-        if mapping:
-            self.hotkeys_listener = keyboard.GlobalHotKeys(mapping)
+        # Start keyboard listener
+        if kb_mapping:
+            self.hotkeys_listener = keyboard.GlobalHotKeys(kb_mapping)
             self.hotkeys_listener.start()
-            n = len(mapping)
+
+        # Start mouse listener if any mouse hotkeys are registered
+        if self._mouse_callbacks:
+            # pynput names extra buttons Button.x1 / Button.x2 on Linux
+            # We compare via str(button) as a universal fallback
+            MOUSE_BTN_ALIASES = {
+                "mouse:middle":  ["middle"],
+                "mouse:button8": ["x1", "button8"],
+                "mouse:button9": ["x2", "button9"],
+            }
+
+            def on_mouse_click(x, y, button, pressed):
+                if not pressed:
+                    return
+                btn_str = str(button).lower().replace("button.", "")
+                for btn_name, cb in self._mouse_callbacks.items():
+                    aliases = MOUSE_BTN_ALIASES.get(btn_name, [btn_name.replace("mouse:", "")])
+                    if btn_str in aliases:
+                        cb()
+                        return
+
+            self.mouse_listener = pmouse.Listener(on_click=on_mouse_click)
+            self.mouse_listener.daemon = True
+            self.mouse_listener.start()
+
+        total = len(kb_mapping) + len(self._mouse_callbacks)
+        if total:
             self.status_pill.setText(
-                f"{n} raccourci{'s' if n > 1 else ''} actif{'s' if n > 1 else ''}"
+                f"{total} raccourci{'s' if total > 1 else ''} actif{'s' if total > 1 else ''}"
             )
         else:
             self.status_pill.setText("Aucun raccourci actif")
@@ -856,6 +960,9 @@ class DofusSwitchApp(QMainWindow):
     def closeEvent(self, event):
         if self.hotkeys_listener:
             try: self.hotkeys_listener.stop()
+            except: pass
+        if self.mouse_listener:
+            try: self.mouse_listener.stop()
             except: pass
         event.accept()
 
